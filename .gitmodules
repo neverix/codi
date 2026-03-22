@@ -1,0 +1,3 @@
+[submodule "compose_facts"]
+	path = compose_facts
+	url = https://github.com/rgreenblatt/compose_facts

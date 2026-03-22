@@ -149,6 +149,7 @@ class CODI(torch.nn.Module):
                         torch.float16 if training_args.bf16 is False else torch.bfloat16
                     ),
                     resume_download=True,
+                    attn_implementation="eager",
                 )
         else:
             self.codi = model_wrapper_class.from_pretrained(

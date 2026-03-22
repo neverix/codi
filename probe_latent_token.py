@@ -41,12 +41,41 @@ from src.model import (
 )
 
 do_print = True
-probe_topk = 5
+probe_topk = 7
 probe_idx = None
-test_attention = False
+test_attention = True
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
+
+def make_eager_attention_mask(attention_mask, dtype):
+    """
+    Create a 4D causal attention mask that works with eager attention.
+
+    The issue with eager attention + left padding is that padding tokens have
+    fully masked rows (all -inf), causing NaN after softmax. This function
+    uses the same fix as SDPA: _unmask_unattended to handle fully masked rows.
+
+    Args:
+        attention_mask: (batch, seq_len) with 1 for real tokens, 0 for padding
+        dtype: the dtype for the mask (should match model dtype)
+
+    Returns:
+        4D attention mask (batch, 1, seq_len, seq_len) ready for attention
+    """
+    from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+
+    batch_size, seq_len = attention_mask.shape
+
+    # Use transformers' converter to create proper 4D causal mask
+    converter = AttentionMaskConverter(is_causal=True, sliding_window=None)
+    mask_4d = converter.to_4d(attention_mask, seq_len, dtype=dtype, key_value_length=seq_len)
+
+    # Apply the same fix SDPA uses: unmask fully masked rows to prevent NaN
+    min_dtype = torch.finfo(dtype).min
+    mask_4d = AttentionMaskConverter._unmask_unattended(mask_4d, min_dtype)
+
+    return mask_4d
 
 def evaluation(model_args, data_args, training_args):
     if model_args.lora_init:
@@ -175,21 +204,77 @@ def evaluation(model_args, data_args, training_args):
     top5_indices_list_decoded = []
     log_count = 0
     log = []
+    def decode_token_or_special(tok_id, b_idx=None, input_toks=None, input_len=0):
+        """Decode a token ID, handling special tokens and latent positions."""
+        tok_id = int(tok_id)
+        if tok_id == model.pad_token_id:
+            return "<PAD>"
+        elif tok_id == model.bot_id:
+            return "<BOT>"
+        elif tok_id == model.eot_id:
+            return "<EOT>"
+        elif tok_id >= model.codi.config.vocab_size - 3:
+            return f"<SPECIAL:{tok_id}>"
+        else:
+            try:
+                return tokenizer.decode([tok_id])
+            except:
+                return f"<UNK:{tok_id}>"
+
     for step, batch in enumerate(question_data):
         batch_size = batch["input_ids"].size(0)
         top5_values_list, top5_indices_list = [], []
+        attn_to_lats = []  # attention info for each latent position
         with torch.no_grad():
             # encode the question
             past_key_values = None
-            outputs = model.codi(input_ids=batch["input_ids"], use_cache=True, output_hidden_states=True, past_key_values=past_key_values, attention_mask=batch["attention_mask"])
+            # Use proper 4D attention mask for eager attention to avoid NaN with left padding
+            eager_attn_mask = make_eager_attention_mask(batch["attention_mask"], dtype=torch.bfloat16)
+            outputs = model.codi(input_ids=batch["input_ids"], use_cache=True, output_hidden_states=True, past_key_values=past_key_values, attention_mask=eager_attn_mask, output_attentions=test_attention)
             past_key_values = outputs.past_key_values
             latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
-            
-            probs = torch.nn.functional.softmax(model.codi.lm_head(latent_embd), dim=-1)  
+
+            # Store input tokens for attention decoding
+            input_tokens = batch["input_ids"]  # (batch, seq_len)
+            input_len = input_tokens.size(1)
+            seq_len_so_far = input_len
+
+            probs = torch.nn.functional.softmax(model.codi.lm_head(latent_embd), dim=-1)
             top5_values, top5_indices = torch.topk(probs, k=probe_topk, dim=2)
             top5_values_list.append(top5_values)
             top5_indices_list.append(top5_indices)
-            
+
+            # Collect attention for the initial latent (bot token position)
+            if test_attention and outputs.attentions is not None:
+                # attentions: tuple of (batch, num_heads, seq_len, seq_len) per layer
+                # Average across layers and heads, get attention from last position
+                attn_stack = torch.stack(outputs.attentions, dim=0)  # (layers, batch, heads, seq, seq)
+                attn_avg = attn_stack.mean(dim=(0, 2))  # (batch, seq, seq) - avg over layers and heads
+                attn_from_last = attn_avg[:, -1, :].clone()  # (batch, seq) - attention from last token to all
+
+                # Mask out padding tokens and first real token before topk
+                padding_mask = (batch["attention_mask"] == 0)  # True for padding
+                attn_from_last[padding_mask] = float('-inf')  # Exclude padding
+                # Find first real token position for each batch item and mask it
+                first_real_pos = batch["attention_mask"].argmax(dim=-1)  # First 1 in attention_mask
+                for b_idx in range(batch_size):
+                    attn_from_last[b_idx, first_real_pos[b_idx]] = float('-inf')
+
+                top_attn_vals, top_attn_idx = torch.topk(attn_from_last, k=probe_topk, dim=-1)
+                # Decode attended tokens for each batch item
+                batch_attn_info = []
+                for b in range(batch_size):
+                    attended = []
+                    for idx in top_attn_idx[b]:
+                        pos = idx.item()
+                        if pos < input_len:
+                            tok = input_tokens[b, pos].item()
+                            attended.append(decode_token_or_special(tok))
+                        else:
+                            attended.append(f"<LAT{pos - input_len}>")
+                    batch_attn_info.append(attended)
+                attn_to_lats.append(batch_attn_info)
+
             if training_args.use_prj:
                 latent_embd = model.prj(latent_embd)
 
@@ -197,15 +282,54 @@ def evaluation(model_args, data_args, training_args):
             inf_latent_iterations = training_args.inf_latent_iterations
             for i in range(inf_latent_iterations):
                 # decode the latent embeddings
-                outputs = model.codi(inputs_embeds=latent_embd, use_cache=True, output_hidden_states=True, past_key_values=past_key_values)
+                outputs = model.codi(inputs_embeds=latent_embd, use_cache=True, output_hidden_states=True, past_key_values=past_key_values, output_attentions=test_attention)
                 past_key_values = outputs.past_key_values
                 latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
+                seq_len_so_far += 1
 
                 # Probe the latent thought before the projection
                 probs = torch.nn.functional.softmax(model.codi.lm_head(latent_embd), dim=-1)
                 top5_values, top5_indices = torch.topk(probs, k=probe_topk, dim=2)
                 top5_values_list.append(top5_values)
                 top5_indices_list.append(top5_indices)
+
+                # Collect attention for this latent iteration
+                if test_attention and outputs.attentions is not None:
+                    # For cached inference, attention is (batch, heads, 1, full_seq)
+                    attn_stack = torch.stack(outputs.attentions, dim=0)  # (layers, batch, heads, 1, full_seq)
+                    attn_avg = attn_stack.mean(dim=(0, 2))  # (batch, 1, full_seq)
+                    attn_from_last = attn_avg[:, -1, :].clone()  # (batch, full_seq)
+
+                    # Mask out padding tokens and first real token before topk
+                    padding_mask = (batch["attention_mask"] == 0)  # (batch, input_len)
+                    # Pad the mask to match full_seq length (input + latents so far)
+                    full_seq_len = attn_from_last.shape[-1]
+                    if padding_mask.shape[-1] < full_seq_len:
+                        # Extend with False (don't mask latent positions)
+                        extra = torch.zeros(batch_size, full_seq_len - padding_mask.shape[-1],
+                                          dtype=torch.bool, device=padding_mask.device)
+                        padding_mask_full = torch.cat([padding_mask, extra], dim=-1)
+                    else:
+                        padding_mask_full = padding_mask
+                    attn_from_last[padding_mask_full] = float('-inf')
+                    # Mask first real token for each batch item
+                    first_real_pos = batch["attention_mask"].argmax(dim=-1)
+                    for b_idx in range(batch_size):
+                        attn_from_last[b_idx, first_real_pos[b_idx]] = float('-inf')
+
+                    top_attn_vals, top_attn_idx = torch.topk(attn_from_last, k=probe_topk, dim=-1)
+                    batch_attn_info = []
+                    for b in range(batch_size):
+                        attended = []
+                        for idx in top_attn_idx[b]:
+                            pos = idx.item()
+                            if pos < input_len:
+                                tok = input_tokens[b, pos].item()
+                                attended.append(decode_token_or_special(tok))
+                            else:
+                                attended.append(f"<LAT{pos - input_len}>")
+                        batch_attn_info.append(attended)
+                    attn_to_lats.append(batch_attn_info)
 
                 if training_args.use_prj:
                     latent_embd = model.prj(latent_embd)
@@ -238,7 +362,7 @@ def evaluation(model_args, data_args, training_args):
 
                 # implement the sampling process
                 if training_args.greedy:
-                    next_token_ids = torch.argmax(logits, dim=-1).squeeze(-1)
+                    next_token_ids = torch.argmax(logits, dim=-1).view(-1)  # view(-1) keeps 1-dim for batch_size=1
                 else:
                     logits /= gen_kwargs["temperature"]
                     if gen_kwargs["top_k"] > 1:
@@ -259,7 +383,7 @@ def evaluation(model_args, data_args, training_args):
                             logits[b, sorted_indices[b, sorted_indices_to_remove[b]]] = -float("inf")
                     
                     probs = F.softmax(logits, dim=-1)
-                    next_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                    next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)  # view(-1) keeps 1-dim for batch_size=1
 
                 # Handle EOS for each sequence
                 for b in range(batch_size):
@@ -300,7 +424,8 @@ def evaluation(model_args, data_args, training_args):
             # decode top5_indices_list
             for ii in range(len(top5_indices_list)): # batch
                 do_log=True
-                if int(answer[log_count]) != int(extract_answer_number(tokenizer.decode(pred_tokens[ii]))):
+                pred_ans = extract_answer_number(tokenizer.decode(pred_tokens[ii]))
+                if math.isinf(pred_ans) or int(answer[log_count]) != int(pred_ans):
                     do_log=False
                 if do_log:
                     log.append(f"Question{log_count}...")

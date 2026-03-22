@@ -1,2 +1,6 @@
 checkpoints/
 claude/logs/
+outputs/
+tmp/
+__pycache__/
+*.slurm
